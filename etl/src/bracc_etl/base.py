@@ -4,8 +4,10 @@ import json
 import logging
 import os
 from abc import ABC, abstractmethod
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -22,6 +24,15 @@ from bracc_etl.loader import (
 from bracc_etl.source_aliases import SCHEMA_VERSION, source_aliases
 
 logger = logging.getLogger(__name__)
+
+
+def _scoped_pipeline_write(method: Any) -> Any:
+    @wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self.load_metrics.operation():
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -140,6 +151,7 @@ class Pipeline(ABC):
             self.transform()
             logger.info("[%s] Starting load...", self.name)
             self.load()
+            self.load_metrics.seal()
             self._sync_load_metrics()
             if self.load_metrics.failed_batches or self.load_metrics.untracked_writes:
                 raise ValueError("load has failed batches or untracked writes")
@@ -164,6 +176,8 @@ class Pipeline(ABC):
             )
             logger.info("[%s] Pipeline complete.", self.name)
         except Exception as exc:
+            with suppress(RuntimeError):
+                self.load_metrics.seal()
             self._sync_load_metrics()
             finished_at = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             self._upsert_ingestion_run(
@@ -179,6 +193,7 @@ class Pipeline(ABC):
             _active_load.reset(token)
             self.empty_load_evidence = None
 
+    @_scoped_pipeline_write
     def run_direct_write(self, query: str, parameters: dict[str, Any] | None = None) -> None:
         """Execute an auto-commit write and record its consumed Neo4j summary."""
         try:
@@ -186,6 +201,7 @@ class Pipeline(ABC):
                 summary = session.run(query, parameters or {}).consume()
             counters = summary.counters
             with self.load_metrics._lock:
+                self.load_metrics.ensure_open()
                 self.load_metrics.nodes_created += counters.nodes_created
                 self.load_metrics.relationships_created += counters.relationships_created
                 self.load_metrics.nodes_deleted += counters.nodes_deleted
@@ -208,8 +224,7 @@ class Pipeline(ABC):
 
     def mark_untracked_write(self) -> None:
         """Fail closed when a direct write has no committed summary."""
-        with self.load_metrics._lock:
-            self.load_metrics.untracked_writes += 1
+        self.load_metrics.record_untracked_write()
 
     def _sync_load_metrics(self) -> None:
         self.rows_loaded = self.load_metrics.verified_rows

@@ -43,9 +43,12 @@ def _parse_excel_date(date_val: str) -> str:
 
 
 def _parse_brl_value(raw: str) -> float:
-    """Parse a Brazilian-formatted value string to float."""
+    """Parse a Brazilian monetary value (or compatible decimal) to float."""
+    value = raw.strip()
+    if "," in value:
+        value = value.replace(".", "").replace(",", ".")
     try:
-        return float(raw.replace(",", "."))
+        return float(value)
     except ValueError:
         return 0.0
 
