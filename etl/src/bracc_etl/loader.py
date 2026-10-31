@@ -2,8 +2,10 @@ import logging
 import os
 import re
 import time
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import wraps
 from threading import RLock
 from typing import Any
 
@@ -20,6 +22,8 @@ class LoadMetrics:
     """Cumulative counts for this loader; writes count only committed transactions."""
 
     _lock: Any = field(default_factory=RLock, repr=False, compare=False)
+    _inflight: int = field(default=0, repr=False, compare=False)
+    _finalized: bool = field(default=False, repr=False, compare=False)
     failed_batches: int = 0
     direct_updates: int = 0
     untracked_writes: int = 0
@@ -38,6 +42,40 @@ class LoadMetrics:
     labels_removed: int = 0
     relationships_resolved: int = 0  # input rows with both endpoints
     unresolved: int = 0  # relationship rows without both endpoints
+
+    @contextmanager
+    def operation(self) -> Any:
+        with self._lock:
+            if self._finalized:
+                raise RuntimeError("load metrics finalized")
+            self._inflight += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._inflight -= 1
+
+    def seal(self) -> None:
+        with self._lock:
+            self._finalized = True
+            if self._inflight:
+                raise RuntimeError("load has active workers")
+
+    def ensure_open(self) -> None:
+        if self._finalized:
+            raise RuntimeError("load metrics finalized")
+
+    def record_untracked_write(self) -> None:
+        with self._lock:
+            self.ensure_open()
+            self.untracked_writes += 1
+
+def _scoped_operation(method: Any) -> Any:
+    @wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self.metrics.operation():
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 _active_load: ContextVar[tuple[Driver, LoadMetrics] | None] = ContextVar(
@@ -64,12 +102,29 @@ def unregister_active_metrics(driver: Driver, metrics: LoadMetrics) -> None:
 
 
 def active_metrics_for_driver(driver: Driver) -> LoadMetrics | None:
+    """Resolve only run ownership carried by this execution context.
+
+    The driver registry is a guard against unbound operations during an active
+    pipeline, never proof that a delayed worker belongs to that run.
+    """
+    active = _active_load.get()
+    if active is not None and active[0] is driver:
+        return active[1]
     with _active_metrics_lock:
-        return _active_metrics_by_driver.get(id(driver))
+        if id(driver) in _active_metrics_by_driver:
+            raise RuntimeError(
+                "pipeline run active for driver; worker must bind run metrics before dispatch"
+            )
+    return None
 
 
 class Neo4jBatchLoader:
-    """Bulk loader with one atomic transaction per batch."""
+    """Bulk loader with one atomic transaction per batch.
+
+    Workers dispatched from a pipeline must capture its ``LoadMetrics`` before
+    dispatch and pass it as ``metrics=``. Unbound driver access while a pipeline
+    run is active fails closed; standalone use outside a run gets private metrics.
+    """
 
     def __init__(
         self,
@@ -84,16 +139,12 @@ class Neo4jBatchLoader:
         self.batch_size = batch_size
         self.neo4j_database = neo4j_database or os.getenv("NEO4J_DATABASE", "neo4j")
         active = _active_load.get()
-        registered = active_metrics_for_driver(driver)
-        self.metrics = (
-            metrics
-            if metrics is not None
-            else active[1]
-            if active is not None and active[0] is driver
-            else registered
-            if registered is not None
-            else LoadMetrics()
-        )
+        if metrics is not None:
+            self.metrics = metrics
+        elif active is not None and active[0] is driver:
+            self.metrics = active[1]
+        else:
+            self.metrics = active_metrics_for_driver(driver) or LoadMetrics()
         self._total_written = 0
 
     def _run_batch_once(
@@ -130,6 +181,7 @@ class Neo4jBatchLoader:
             batch = rows[i : i + size]
             for attempt in range(_MAX_RETRIES):
                 with self.metrics._lock:
+                    self.metrics.ensure_open()
                     self.metrics.attempts += 1
                 try:
                     counters, resolved = self._run_batch_once(query, batch, relationship)
@@ -137,6 +189,7 @@ class Neo4jBatchLoader:
                 except TransientError:
                     if attempt == _MAX_RETRIES - 1:
                         with self.metrics._lock:
+                            self.metrics.ensure_open()
                             self.metrics.failed_batches += 1
                         raise
                     wait = 2**attempt
@@ -146,9 +199,11 @@ class Neo4jBatchLoader:
                     time.sleep(wait)
                 except Exception:
                     with self.metrics._lock:
+                        self.metrics.ensure_open()
                         self.metrics.failed_batches += 1
                     raise
             with self.metrics._lock:
+                self.metrics.ensure_open()
                 self.metrics.committed_rows += len(batch)
                 self.metrics.nodes_created += counters.nodes_created
                 self.metrics.relationships_created += counters.relationships_created
@@ -179,6 +234,7 @@ class Neo4jBatchLoader:
             self._total_written += len(batch)
         return total
 
+    @_scoped_operation
     def run_query_with_retry(
         self, query: str, rows: list[dict[str, Any]], batch_size: int = 500
     ) -> int:
@@ -188,14 +244,18 @@ class Neo4jBatchLoader:
         actual database update counters; idempotent writes can have zero updates.
         """
         with self.metrics._lock:
+            self.metrics.ensure_open()
             self.metrics.submitted += len(rows)
         return self._run_batches(query, rows, batch_size)
 
+    @_scoped_operation
     def load_nodes(self, label: str, rows: list[dict[str, Any]], key_field: str) -> int:
         with self.metrics._lock:
+            self.metrics.ensure_open()
             self.metrics.submitted += len(rows)
         accepted = [r for r in rows if r.get(key_field)]
         with self.metrics._lock:
+            self.metrics.ensure_open()
             self.metrics.rejected += len(rows) - len(accepted)
         all_keys: set[str] = set()
         for row in accepted:
@@ -209,6 +269,7 @@ class Neo4jBatchLoader:
         )
         return self._run_batches(query, accepted, nodes=True)
 
+    @_scoped_operation
     def load_relationships(
         self,
         rel_type: str,
@@ -220,9 +281,11 @@ class Neo4jBatchLoader:
         properties: list[str] | None = None,
     ) -> int:
         with self.metrics._lock:
+            self.metrics.ensure_open()
             self.metrics.submitted += len(rows)
         accepted = [r for r in rows if r.get("source_key") and r.get("target_key")]
         with self.metrics._lock:
+            self.metrics.ensure_open()
             self.metrics.rejected += len(rows) - len(accepted)
         props = ""
         if properties:
@@ -244,8 +307,10 @@ class Neo4jBatchLoader:
         )
         return self._run_batches(query, accepted, relationship=True)
 
+    @_scoped_operation
     def run_query(self, query: str, rows: list[dict[str, Any]]) -> int:
         """Return committed input rows, not matched rows or writes; see metrics."""
         with self.metrics._lock:
+            self.metrics.ensure_open()
             self.metrics.submitted += len(rows)
         return self._run_batches(query, rows)

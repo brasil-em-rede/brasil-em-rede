@@ -201,9 +201,10 @@ def test_threaded_loader_metrics_and_direct_commit_receipt():
 
         def load(self):
             prefix = uuid4().hex
+            metrics = self.load_metrics
 
             def worker(i):
-                loader = Neo4jBatchLoader(self.driver)
+                loader = Neo4jBatchLoader(self.driver, metrics=metrics)
                 loader.load_nodes("F06Thread", [{"id": f"{prefix}-{i}"}], "id")
 
             with ThreadPoolExecutor(max_workers=4) as pool:
