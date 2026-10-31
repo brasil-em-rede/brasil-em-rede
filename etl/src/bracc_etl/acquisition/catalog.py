@@ -10,7 +10,9 @@ import hashlib
 import os
 import re
 import tempfile
+import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -94,6 +96,73 @@ def register_raw_artifact(
         partition_id=partition_id,
         object_key=key,
     )
+
+
+def publish_partition(
+    catalog: Catalog,
+    manifest: Manifest,
+    pages: list[str],
+    artifact_directory: Path,
+    *,
+    storage_root: Path,
+    run_id: UUID,
+    idempotency_key: str,
+    attempt_id: UUID,
+    owner: UUID,
+    manifest_id: UUID,
+    dataset_id: str,
+    access_class: str,
+    lease_duration: timedelta = timedelta(minutes=5),
+) -> list[RawArtifactRef]:
+    """Register a complete, verified partition under a fenced U03 attempt.
+
+    Immutable objects publish before database rows; rejection may leave unreferenced
+    objects but never indicates success. The caller owns the connection lifetime.
+    """
+    if not pages or len(pages) != len(set(pages)):
+        raise ValueError("partition requires a non-empty unique page set")
+    saved = Manifest.open(manifest.path, manifest.source_id, manifest.partition)
+    if set(saved.pages) != set(pages):
+        raise ValueError("page set must exactly match the complete acquisition manifest")
+    for page in pages:
+        if not page or Path(page).name != page or page in {".", ".."}:
+            raise ValueError("invalid artifact page")
+        record = saved.pages[page]
+        path = artifact_directory / page
+        if not path.is_file() or _digest(path) != (record.get("sha256"), record.get("bytes")):
+            raise ValueError("artifact bytes disagree with acquisition manifest")
+    token = catalog.lease(manifest.partition, owner, lease_duration)
+    if token is None:
+        raise ValueError("partition lease unavailable")
+    refs: list[RawArtifactRef] = []
+    with catalog.transaction():
+        catalog.start_attempt(run_id, idempotency_key, attempt_id, manifest.partition, owner, token)
+        for page in pages:
+            artifact_id = uuid.uuid5(
+                attempt_id, f"{manifest.source_id}/{manifest.partition}/{page}"
+            )
+            refs.append(
+                register_raw_artifact(
+                    catalog,
+                    saved,
+                    page,
+                    artifact_directory / page,
+                    storage_root=storage_root,
+                    artifact_id=artifact_id,
+                    partition_id=manifest.partition,
+                    dataset_id=dataset_id,
+                    access_class=access_class,
+                )
+            )
+        catalog.manifest(
+            manifest_id,
+            manifest.partition,
+            [ref.artifact_id for ref in refs],
+            owner,
+            token,
+            attempt_id,
+        )
+    return refs
 
 
 def _digest(path: Path) -> tuple[str, int]:
