@@ -150,6 +150,8 @@ def test_active_metrics_registration_rejects_concurrent_run_for_driver():
     try:
         with pytest.raises(RuntimeError, match="concurrent pipeline runs"):
             register_active_metrics(driver, second)
-        assert Neo4jBatchLoader(driver).metrics is first
+        with pytest.raises(RuntimeError, match="worker must bind run metrics"):
+            Neo4jBatchLoader(driver)
+        assert Neo4jBatchLoader(driver, metrics=first).metrics is first
     finally:
         unregister_active_metrics(driver, first)

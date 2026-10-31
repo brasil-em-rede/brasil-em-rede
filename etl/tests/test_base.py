@@ -290,15 +290,16 @@ def test_direct_write_records_consumed_counters() -> None:
             pipeline.load_metrics.labels_removed) == (6, 7, 8)
 
 
-def test_loader_created_in_worker_thread_uses_pipeline_run_metrics() -> None:
+def test_loader_created_in_worker_thread_uses_explicit_pipeline_run_metrics() -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     pipeline = DummyPipeline()
 
     def threaded_load() -> None:
+        metrics = pipeline.load_metrics
         with ThreadPoolExecutor(max_workers=1) as pool:
             pool.submit(
-                lambda: Neo4jBatchLoader(pipeline.driver).load_nodes(
+                lambda: Neo4jBatchLoader(pipeline.driver, metrics=metrics).load_nodes(
                     "Test", [{"id": "threaded"}], "id"
                 )
             ).result()
