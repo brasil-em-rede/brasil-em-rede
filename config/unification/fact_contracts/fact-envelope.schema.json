@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brasil-em-rede.example/schemas/fact-envelope.v1.json",
+  "title": "Brasil em Rede fact and evidence envelope",
+  "description": "Structural and lexical shape only. The public Python reader additionally rejects duplicate raw JSON names, noncanonical tagged values, unordered/duplicate tagged object keys, and semantic cross-field violations; schema success alone is not readiness for consumption.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event", "observation"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "event": {"$ref": "#/$defs/factEvent"},
+    "observation": {"$ref": "#/$defs/observationRevision"},
+    "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidenceRef"}}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "uuid": {"type": "string", "format": "uuid"},
+    "awareDatetime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "(?:Z|[+-](?:0[0-9]|1[0-9]|2[0-3]):[0-5][0-9])$"
+    },
+    "entityRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity_type", "status"],
+      "properties": {
+        "entity_id": {"oneOf": [{"$ref": "#/$defs/uuid"}, {"type": "null"}]},
+        "entity_type": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "namespace": {"oneOf": [{"type": "string", "minLength": 1, "pattern": "\\S"}, {"type": "null"}]},
+        "scope": {"oneOf": [{"type": "string", "minLength": 1, "pattern": "\\S"}, {"type": "null"}]},
+        "status": {"enum": ["unresolved", "exact_reference", "candidate_reference"]}
+      },
+      "allOf": [
+        {"if": {"properties": {"status": {"const": "unresolved"}}, "required": ["status"]}, "then": {"properties": {"entity_id": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"enum": ["exact_reference", "candidate_reference"]}}, "required": ["status"]}, "then": {"required": ["entity_id"], "properties": {"entity_id": {"$ref": "#/$defs/uuid"}}}}
+      ]
+    },
+    "wireValue": {
+      "oneOf": [
+        {"$ref": "#/$defs/wireNull"},
+        {"$ref": "#/$defs/wireBool"},
+        {"$ref": "#/$defs/wireInt"},
+        {"$ref": "#/$defs/wireFloat"},
+        {"$ref": "#/$defs/wireString"},
+        {"$ref": "#/$defs/wireDecimal"},
+        {"$ref": "#/$defs/wireUuid"},
+        {"$ref": "#/$defs/wireDate"},
+        {"$ref": "#/$defs/wireDatetime"},
+        {"$ref": "#/$defs/wireArray"},
+        {"$ref": "#/$defs/wireObject"}
+      ]
+    },
+    "wireDocument": {
+      "type": "array",
+      "prefixItems": [{"const": "br-acc-typed-json/v1"}, {"$ref": "#/$defs/wireValue"}],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "wireNullDocument": {
+      "type": "array",
+      "prefixItems": [{"const": "br-acc-typed-json/v1"}, {"$ref": "#/$defs/wireNull"}],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "wireNull": {"type": "array", "prefixItems": [{"const": "null"}, {"type": "null"}], "items": false, "minItems": 2, "maxItems": 2},
+    "wireBool": {"type": "array", "prefixItems": [{"const": "bool"}, {"type": "boolean"}], "items": false, "minItems": 2, "maxItems": 2},
+    "wireInt": {"type": "array", "prefixItems": [{"const": "int"}, {"type": "integer"}], "items": false, "minItems": 2, "maxItems": 2},
+    "wireFloat": {"type": "array", "prefixItems": [{"const": "float"}, {"type": "string", "pattern": "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$"}], "items": false, "minItems": 2, "maxItems": 2},
+    "wireString": {"type": "array", "prefixItems": [{"const": "string"}, {"type": "string"}], "items": false, "minItems": 2, "maxItems": 2},
+    "wireDecimal": {"type": "array", "prefixItems": [{"const": "decimal"}, {"type": "string", "pattern": "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$"}], "items": false, "minItems": 2, "maxItems": 2},
+    "wireUuid": {"type": "array", "prefixItems": [{"const": "uuid"}, {"$ref": "#/$defs/uuid"}], "items": false, "minItems": 2, "maxItems": 2},
+    "wireDate": {"type": "array", "prefixItems": [{"const": "date"}, {"type": "string", "format": "date"}], "items": false, "minItems": 2, "maxItems": 2},
+    "wireDatetime": {"type": "array", "prefixItems": [{"const": "datetime"}, {"$ref": "#/$defs/awareDatetime"}], "items": false, "minItems": 2, "maxItems": 2},
+    "wireArray": {"type": "array", "prefixItems": [{"const": "array"}, {"type": "array", "items": {"$ref": "#/$defs/wireValue"}}], "items": false, "minItems": 2, "maxItems": 2},
+    "wireObject": {
+      "type": "array",
+      "prefixItems": [
+        {"const": "object"},
+        {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "string"}, {"$ref": "#/$defs/wireValue"}], "items": false, "minItems": 2, "maxItems": 2}}
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "factEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "source_id", "dataset_id", "dataset_contract_version", "subject", "predicate", "object", "date_precision"],
+      "properties": {
+        "event_id": {"$ref": "#/$defs/uuid"},
+        "source_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "dataset_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "dataset_contract_version": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "source_record_key": {"oneOf": [{"type": "string", "minLength": 1, "pattern": "\\S"}, {"type": "null"}]},
+        "subject": {"$ref": "#/$defs/entityRef"},
+        "predicate": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "object": {"oneOf": [{"$ref": "#/$defs/wireDocument"}, {"$ref": "#/$defs/entityRef"}]},
+        "event_at": {"oneOf": [{"type": "string", "format": "date"}, {"$ref": "#/$defs/awareDatetime"}, {"type": "null"}]},
+        "valid_from": {"oneOf": [{"type": "string", "format": "date"}, {"$ref": "#/$defs/awareDatetime"}, {"type": "null"}]},
+        "valid_to": {"oneOf": [{"type": "string", "format": "date"}, {"$ref": "#/$defs/awareDatetime"}, {"type": "null"}]},
+        "date_precision": {"enum": ["day", "instant", "unknown"]}
+      },
+      "allOf": [
+        {"if": {"properties": {"date_precision": {"const": "day"}}, "required": ["date_precision"]}, "then": {"properties": {"event_at": {"oneOf": [{"type": "string", "format": "date"}, {"type": "null"}]}, "valid_from": {"oneOf": [{"type": "string", "format": "date"}, {"type": "null"}]}, "valid_to": {"oneOf": [{"type": "string", "format": "date"}, {"type": "null"}]}}}},
+        {"if": {"properties": {"date_precision": {"const": "instant"}}, "required": ["date_precision"]}, "then": {"properties": {"event_at": {"oneOf": [{"$ref": "#/$defs/awareDatetime"}, {"type": "null"}]}, "valid_from": {"oneOf": [{"$ref": "#/$defs/awareDatetime"}, {"type": "null"}]}, "valid_to": {"oneOf": [{"$ref": "#/$defs/awareDatetime"}, {"type": "null"}]}}}},
+        {"if": {"properties": {"date_precision": {"const": "unknown"}}, "required": ["date_precision"]}, "then": {"properties": {"event_at": {"type": "null"}, "valid_from": {"type": "null"}, "valid_to": {"type": "null"}}}}
+      ]
+    },
+    "observationRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_id", "dataset_id", "dataset_contract_version", "artifact_id", "artifact_sha256", "record_locator", "locator_kind", "payload_schema_version", "payload", "revision_no", "action"],
+      "properties": {
+        "source_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "dataset_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "dataset_contract_version": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "artifact_id": {"$ref": "#/$defs/uuid"},
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "record_locator": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "locator_kind": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "payload_schema_version": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "payload": {"$ref": "#/$defs/wireDocument"},
+        "revision_no": {"type": "integer", "minimum": 1},
+        "action": {"enum": ["assert", "correct", "retract"]},
+        "source_record_key": {"oneOf": [{"type": "string", "minLength": 1, "pattern": "\\S"}, {"type": "null"}]},
+        "source_release": {"oneOf": [{"type": "string", "minLength": 1, "pattern": "\\S"}, {"type": "null"}]},
+        "parser_version": {"oneOf": [{"type": "string", "minLength": 1, "pattern": "\\S"}, {"type": "null"}]},
+        "normalizer_version": {"oneOf": [{"type": "string", "minLength": 1, "pattern": "\\S"}, {"type": "null"}]},
+        "observed_at": {"oneOf": [{"$ref": "#/$defs/awareDatetime"}, {"type": "null"}]},
+        "supersedes_observation_id": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+      },
+      "allOf": [
+        {"if": {"properties": {"action": {"const": "assert"}}, "required": ["action"]}, "then": {"properties": {"revision_no": {"const": 1}, "supersedes_observation_id": {"type": "null"}}}},
+        {"if": {"properties": {"action": {"const": "correct"}}, "required": ["action"]}, "then": {"properties": {"revision_no": {"minimum": 2}, "supersedes_observation_id": {"$ref": "#/$defs/sha256"}}}},
+        {"if": {"properties": {"action": {"const": "retract"}}, "required": ["action"]}, "then": {"properties": {"revision_no": {"minimum": 2}, "supersedes_observation_id": {"$ref": "#/$defs/sha256"}, "payload": {"$ref": "#/$defs/wireNullDocument"}}}}
+      ]
+    },
+    "evidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observation_id", "artifact_id", "artifact_sha256", "record_locator", "locator_kind"],
+      "properties": {
+        "observation_id": {"$ref": "#/$defs/sha256"},
+        "artifact_id": {"$ref": "#/$defs/uuid"},
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "record_locator": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "locator_kind": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "field_path": {"oneOf": [{"type": "string", "minLength": 1, "pattern": "\\S"}, {"type": "null"}]}
+      }
+    }
+  }
+}

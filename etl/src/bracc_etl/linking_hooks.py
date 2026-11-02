@@ -64,9 +64,15 @@ def run_post_load_hooks(
         logger.info("No post-load linking hook configured for source=%s", source)
         return
 
-    for name in script_names:
-        script_path = scripts_dir / name
-        if not script_path.exists():
-            logger.warning("Post-load linking script missing (skipped): %s", script_path)
-            continue
+    script_paths = [scripts_dir / name for name in script_names]
+    unavailable = [
+        path
+        for path in script_paths
+        if not path.is_file() or not path.read_text(encoding="utf-8").strip()
+    ]
+    if unavailable:
+        names = ", ".join(str(path) for path in unavailable)
+        raise RuntimeError(f"Required post-load linking script missing or empty: {names}")
+
+    for script_path in script_paths:
         _run_script(driver, neo4j_database, script_path)
