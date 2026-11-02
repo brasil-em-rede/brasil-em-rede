@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,6 +16,12 @@ from uuid import uuid4
 
 from neo4j import Driver
 
+from bracc_etl.extraction import (
+    ExtractionContractError,
+    ExtractionResult,
+    TransformPlan,
+    execute_transform,
+)
 from bracc_etl.loader import (
     LoadMetrics,
     _active_load,
@@ -37,11 +44,7 @@ def _scoped_pipeline_write(method: Any) -> Any:
 
 @dataclass(frozen=True)
 class EmptyLoadEvidence:
-    """An acquisition manifest and its actual JSON or CSV source artifact.
-
-    The caller supplies the configured source URL independently of the manifest.
-    The hashes link the manifest to that URL and the observed artifact bytes.
-    """
+    """An acquisition manifest and its actual JSON or CSV source artifact."""
 
     path: str
     sha256: str
@@ -56,8 +59,6 @@ class EmptyLoadEvidence:
             raw = artifact.read_bytes()
             manifest = json.loads(content)
             pages = manifest["pages"]
-            # A single empty page cannot justify an empty source when the
-            # acquisition manifest contains additional pages.
             if not isinstance(pages, dict) or len(pages) != 1:
                 return False
             record = pages[artifact.name]
@@ -112,9 +113,9 @@ class Pipeline(ABC):
         self.history = history
         self.rows_in: int = 0
         self.rows_loaded: int = 0
-        # Pipelines that legitimately load no rows must provide auditable evidence.
         self.empty_load_evidence: EmptyLoadEvidence | None = None
         self.configured_source_url: str | None = None
+        self.extraction_adapter: Any | None = None
         self.load_metrics = LoadMetrics()
         self.source_identity = source_aliases().for_pipeline(self.name, self.source_id)
         source_key = getattr(self, "source_id", getattr(self, "name", "unknown_source"))
@@ -132,6 +133,18 @@ class Pipeline(ABC):
     def load(self) -> None:
         """Load transformed data into Neo4j."""
 
+    def produce_extraction(self) -> tuple[ExtractionResult, tuple[Any, ...]]:
+        """Override to opt into the structured extraction contract."""
+        raise ExtractionContractError("structured extraction is not configured")
+
+    def transform_result(self, result: ExtractionResult) -> TransformPlan:
+        """Transform a verified stream into the exact rows passed to structured loading."""
+        raise ExtractionContractError("structured consumer is not configured")
+
+    def load_extraction(self, records: Sequence[dict[str, Any]]) -> None:
+        """Load the concrete output of transform_result for an opt-in adapter."""
+        raise ExtractionContractError("structured loader is not configured")
+
     def run(self) -> None:
         """Execute the full ETL pipeline."""
         self.run_id = f"{self.source_id}_{uuid4().hex}"
@@ -142,37 +155,79 @@ class Pipeline(ABC):
         self._upsert_ingestion_run(status="running", started_at=started_at)
         token = _active_load.set((self.driver, self.load_metrics))
         metrics_registered = False
+        cursors: tuple[Any, ...] = ()
+        structured = type(self).produce_extraction is not Pipeline.produce_extraction
         try:
             register_active_metrics(self.driver, self.load_metrics)
             metrics_registered = True
-            logger.info("[%s] Starting extraction...", self.name)
-            self.extract()
-            logger.info("[%s] Starting transformation...", self.name)
-            self.transform()
-            logger.info("[%s] Starting load...", self.name)
-            self.load()
+            if structured:
+                result, cursors = self.produce_extraction()
+                if (
+                    not isinstance(result, ExtractionResult)
+                    or result.run_id != self.run_id
+                    or result.source_id != self.source_identity.source_id
+                    or result.source_url != self.configured_source_url
+                ):
+                    raise ExtractionContractError("producer result identity mismatch")
+                owned_cursors = tuple(
+                    cursor for population in result.populations for cursor in population._cursors
+                )
+                if owned_cursors != cursors or len({id(cursor) for cursor in cursors}) != len(
+                    cursors
+                ):
+                    raise ExtractionContractError("cursor binding mismatch or sharing")
+                original_bindings = tuple(
+                    (cursor, cursor.binding)
+                    for population in result.populations
+                    for cursor in population._cursors
+                )
+                if tuple(
+                    binding for population in result.populations for binding in population.bindings
+                ) != tuple(binding for _, binding in original_bindings):
+                    raise ExtractionContractError("manifest binding mismatch")
+                plan = self.transform_result(result)
+                if any(cursor.binding != binding for cursor, binding in original_bindings):
+                    raise ExtractionContractError("artifact binding was mutated")
+                verified_output = execute_transform(result, cursors, plan)
+                current_adapter = self.extraction_adapter
+                if (
+                    current_adapter is None
+                    or tuple(
+                        (spec.population_id, spec.required) for spec in current_adapter.populations
+                    )
+                    != result.adapter_policy
+                ):
+                    raise ExtractionContractError("adapter policy binding mismatch")
+                self.load_extraction(verified_output.rows)
+            else:
+                self.extract()
+                self.transform()
+                self.load()
             self.load_metrics.seal()
             self._sync_load_metrics()
             if self.load_metrics.failed_batches or self.load_metrics.untracked_writes:
                 raise ValueError("load has failed batches or untracked writes")
             if (
+                not structured
+                and self.load_metrics.submitted == 0
+                and self.rows_loaded == 0
+                and self.load_metrics.generic_updates == 0
+                and self.load_metrics.direct_updates == 0
+                and isinstance(self.empty_load_evidence, EmptyLoadEvidence)
+            ):
+                raise ExtractionContractError(
+                    "legacy empty evidence cannot prove extracted population"
+                )
+            if (
                 self.rows_loaded == 0
                 and self.load_metrics.generic_updates == 0
                 and self.load_metrics.direct_updates == 0
-                and not (
-                    self.load_metrics.submitted == 0
-                    and isinstance(self.empty_load_evidence, EmptyLoadEvidence)
-                    and self.empty_load_evidence.verify(
-                        self.source_identity.source_id, self.configured_source_url
-                    )
-                )
+                and not structured
             ):
-                raise ValueError("empty load requires evidence")
+                raise ValueError("empty load requires structured extraction evidence")
             finished_at = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             self._upsert_ingestion_run(
-                status="loaded",
-                started_at=started_at,
-                finished_at=finished_at,
+                status="loaded", started_at=started_at, finished_at=finished_at
             )
             logger.info("[%s] Pipeline complete.", self.name)
         except Exception as exc:
@@ -188,6 +243,9 @@ class Pipeline(ABC):
             )
             raise
         finally:
+            for cursor in cursors:
+                with suppress(Exception):
+                    cursor.close()
             if metrics_registered:
                 unregister_active_metrics(self.driver, self.load_metrics)
             _active_load.reset(token)
@@ -267,9 +325,8 @@ class Pipeline(ABC):
             "    r.labels_removed = $labels_removed, "
             "    r.relationships_resolved = $relationships_resolved, r.unresolved = $unresolved"
         )
-        run_id = getattr(self, "run_id", f"{self.source_id}_manual")
         params = {
-            "run_id": run_id,
+            "run_id": getattr(self, "run_id", f"{self.source_id}_manual"),
             "source_id": identity.source_id,
             "runner_name": identity.runner_name,
             "provider_id": identity.provider_id,
@@ -280,26 +337,20 @@ class Pipeline(ABC):
             "error": error,
             "rows_in": self.rows_in,
             "rows_loaded": self.rows_loaded,
-            "empty_load_evidence_path": (
-                self.empty_load_evidence.path
-                if isinstance(self.empty_load_evidence, EmptyLoadEvidence)
-                else None
-            ),
-            "empty_load_evidence_sha256": (
-                self.empty_load_evidence.sha256
-                if isinstance(self.empty_load_evidence, EmptyLoadEvidence)
-                else None
-            ),
-            "empty_load_artifact_path": (
-                self.empty_load_evidence.artifact_path
-                if isinstance(self.empty_load_evidence, EmptyLoadEvidence)
-                else None
-            ),
-            "empty_load_source_sha256": (
-                hashlib.sha256(self.empty_load_evidence.source_url.encode()).hexdigest()
-                if isinstance(self.empty_load_evidence, EmptyLoadEvidence)
-                else None
-            ),
+            "empty_load_evidence_path": self.empty_load_evidence.path
+            if isinstance(self.empty_load_evidence, EmptyLoadEvidence)
+            else None,
+            "empty_load_evidence_sha256": self.empty_load_evidence.sha256
+            if isinstance(self.empty_load_evidence, EmptyLoadEvidence)
+            else None,
+            "empty_load_artifact_path": self.empty_load_evidence.artifact_path
+            if isinstance(self.empty_load_evidence, EmptyLoadEvidence)
+            else None,
+            "empty_load_source_sha256": hashlib.sha256(
+                self.empty_load_evidence.source_url.encode()
+            ).hexdigest()
+            if isinstance(self.empty_load_evidence, EmptyLoadEvidence)
+            else None,
             **{k: v for k, v in vars(self.load_metrics).items() if not k.startswith("_")},
         }
         with self.driver.session(database=self.neo4j_database) as session:
