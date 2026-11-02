@@ -73,13 +73,49 @@ def test_unregistered_pipeline_is_rejected() -> None:
 def test_empty_load_requires_evidence_and_records_failure() -> None:
     pipeline = DummyPipeline()
     pipeline.load = lambda: None
-    with pytest.raises(ValueError, match="empty load requires evidence"):
+    with pytest.raises(ValueError, match="empty load requires structured extraction evidence"):
         pipeline.run()
     session = pipeline.driver.session.return_value.__enter__.return_value
     assert session.run.call_args.args[1]["status"] == "quality_fail"
 
 
-def test_empty_load_with_evidence_is_recorded(tmp_path) -> None:
+def test_legacy_empty_evidence_is_not_population_proof(tmp_path) -> None:
+    pipeline = DummyPipeline()
+    pipeline.load = lambda: None
+    raw = b"[]"
+    artifact = tmp_path / "unrelated-empty.json"
+    artifact.write_bytes(raw)
+    source_url = "https://example.test/empty.json"
+    manifest = {
+        "source_id": "cnpj",
+        "pages": {
+            artifact.name: {
+                "source_sha256": hashlib.sha256(source_url.encode()).hexdigest(),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "bytes": len(raw),
+            }
+        },
+    }
+    content = json.dumps(manifest).encode()
+    path = tmp_path / "manifest.json"
+    path.write_bytes(content)
+    pipeline.empty_load_evidence = EmptyLoadEvidence(
+        str(path), hashlib.sha256(content).hexdigest(), str(artifact), source_url, "json"
+    )
+    pipeline.configured_source_url = source_url
+    pipeline.extract = lambda: setattr(pipeline, "source_rows", [{"id": "discarded"}])
+    pipeline.transform = lambda: setattr(pipeline, "source_rows", [])
+
+    with pytest.raises(ValueError, match="legacy empty evidence cannot prove"):
+        pipeline.run()
+
+    session = pipeline.driver.session.return_value.__enter__.return_value
+    statuses = [call.args[1]["status"] for call in session.run.call_args_list]
+    assert statuses == ["running", "quality_fail"]
+    assert not pipeline.loaded
+
+
+def test_empty_load_with_evidence_is_rejected_for_legacy_pipeline(tmp_path) -> None:
     pipeline = DummyPipeline()
     pipeline.load = lambda: None
     raw = b"[]"
@@ -103,11 +139,10 @@ def test_empty_load_with_evidence_is_recorded(tmp_path) -> None:
         str(path), hashlib.sha256(content).hexdigest(), str(artifact), source_url, "json"
     )
     pipeline.configured_source_url = source_url
-    pipeline.run()
+    with pytest.raises(ValueError, match="legacy empty evidence cannot prove"):
+        pipeline.run()
     session = pipeline.driver.session.return_value.__enter__.return_value
-    params = session.run.call_args.args[1]
-    assert params["status"] == "loaded"
-    assert params["empty_load_evidence_sha256"] == hashlib.sha256(content).hexdigest()
+    assert session.run.call_args.args[1]["status"] == "quality_fail"
     assert pipeline.empty_load_evidence is None
 
 
@@ -126,7 +161,7 @@ def test_empty_manifest_hash_must_match(tmp_path) -> None:
     path = tmp_path / "manifest.json"
     path.write_text('{"source_id":"cnpj","record_count":0}')
     pipeline.empty_load_evidence = EmptyLoadEvidence(str(path), "0" * 64)
-    with pytest.raises(ValueError, match="empty load requires evidence"):
+    with pytest.raises(ValueError, match="legacy empty evidence cannot prove extracted population"):
         pipeline.run()
 
 
@@ -195,7 +230,7 @@ def test_empty_evidence_rejects_manifest_with_other_pages(tmp_path) -> None:
     pipeline.load = lambda: None
     pipeline.empty_load_evidence = evidence
     pipeline.configured_source_url = url
-    with pytest.raises(ValueError, match="empty load requires evidence"):
+    with pytest.raises(ValueError, match="legacy empty evidence cannot prove extracted population"):
         pipeline.run()
     session = pipeline.driver.session.return_value.__enter__.return_value
     assert session.run.call_args.args[1]["status"] == "quality_fail"
