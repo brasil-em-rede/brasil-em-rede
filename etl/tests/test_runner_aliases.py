@@ -60,7 +60,7 @@ def test_status_reads_old_alias_and_reports_unmapped_or_conflicting_runs() -> No
     driver.close.assert_called_once()
 
 
-def test_run_cli_links_and_verifies_empty_evidence_to_source_url(tmp_path) -> None:
+def test_run_cli_rejects_legacy_empty_evidence_for_source_url(tmp_path) -> None:
     source_url = "https://example.test/data.json"
     manifest = tmp_path / "manifest.json"
     artifact = tmp_path / "page.json"
@@ -94,11 +94,11 @@ def test_run_cli_links_and_verifies_empty_evidence_to_source_url(tmp_path) -> No
                 "--empty-evidence-format", "json",
             ],
         )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code != 0
+    assert isinstance(result.exception, ValueError)
+    assert str(result.exception) == "legacy empty evidence cannot prove extracted population"
     run_calls = driver.session.return_value.__enter__.return_value.run.call_args_list
-    run_params = [call.args[1] for call in run_calls]
-    assert [params["status"] for params in run_params] == ["running", "loaded"]
-    assert run_params[-1]["empty_load_artifact_path"] == str(artifact)
+    assert [call.args[1]["status"] for call in run_calls] == ["running", "quality_fail"]
 
 
 def test_run_cli_rejects_incomplete_empty_evidence_before_driver(tmp_path) -> None:
@@ -158,7 +158,7 @@ def test_run_cli_records_quality_fail_for_invalid_empty_evidence(tmp_path, failu
         )
     assert result.exit_code != 0
     assert isinstance(result.exception, ValueError)
-    assert str(result.exception) == "empty load requires evidence"
+    assert str(result.exception) == "legacy empty evidence cannot prove extracted population"
     run_calls = driver.session.return_value.__enter__.return_value.run.call_args_list
     run_params = [call.args[1] for call in run_calls]
     assert [params["status"] for params in run_params] == ["running", "quality_fail"]
