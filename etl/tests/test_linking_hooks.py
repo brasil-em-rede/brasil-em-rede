@@ -6,6 +6,18 @@ import pytest
 from bracc_etl import linking_hooks
 
 
+def test_split_statements_removes_full_line_comments_before_semicolon_split() -> None:
+    schema = Path(__file__).resolve().parents[2] / "api/src/bracc/queries/schema_init.cypher"
+    raw = schema.read_text(encoding="utf-8")
+
+    statements = linking_hooks._split_statements(raw)
+
+    assert statements
+    assert all(not statement.startswith("cross-label") for statement in statements)
+    assert any("CREATE CONSTRAINT person_entity_id_unique" in statement for statement in statements)
+    assert any("CREATE CONSTRAINT company_cnpj_unique" in statement for statement in statements)
+
+
 @pytest.fixture
 def hook_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     repo_root = tmp_path / "repo"

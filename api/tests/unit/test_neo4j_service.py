@@ -3,7 +3,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from bracc.services.neo4j_service import CypherLoader, execute_query, execute_query_single
+from bracc.services.neo4j_service import (
+    CypherLoader,
+    ensure_schema,
+    execute_query,
+    execute_query_single,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +65,27 @@ class TestCypherLoader:
             assert "clearable" not in CypherLoader._cache
         finally:
             mod.QUERIES_DIR = original
+
+
+class TestEnsureSchema:
+    @pytest.mark.anyio
+    async def test_shipped_schema_comments_are_removed_before_statement_split(self) -> None:
+        driver = MagicMock()
+        session = AsyncMock()
+        session_context = MagicMock()
+        session_context.__aenter__ = AsyncMock(return_value=session)
+        session_context.__aexit__ = AsyncMock(return_value=None)
+        driver.session.return_value = session_context
+
+        await ensure_schema(driver)
+
+        statements = [call.args[0] for call in session.run.call_args_list]
+        assert statements
+        assert all(not statement.startswith("cross-label") for statement in statements)
+        assert any(
+            "CREATE CONSTRAINT person_entity_id_unique" in statement for statement in statements
+        )
+        assert any("CREATE CONSTRAINT company_cnpj_unique" in statement for statement in statements)
 
 
 class TestExecuteQuery:
