@@ -81,12 +81,11 @@ def sanitize_props(
 async def ensure_schema(driver: AsyncDriver) -> None:
     """Run schema_init.cypher statements on startup. All use IF NOT EXISTS so idempotent."""
     raw = CypherLoader.load("schema_init")
-    statements = [s.strip() for s in raw.split(";") if s.strip()]
+    schema_without_line_comments = "\n".join(
+        line for line in raw.splitlines() if not line.lstrip().startswith("//")
+    )
+    statements = [s.strip() for s in schema_without_line_comments.split(";") if s.strip()]
     async with driver.session(database=settings.neo4j_database) as session:
         for stmt in statements:
-            # Skip comment-only lines
-            lines = [ln for ln in stmt.splitlines() if not ln.strip().startswith("//")]
-            cypher = "\n".join(lines).strip()
-            if cypher:
-                await session.run(cypher)
+            await session.run(stmt)
     logger.info("Schema bootstrap complete: %d statements executed", len(statements))

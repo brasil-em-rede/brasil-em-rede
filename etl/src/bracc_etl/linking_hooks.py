@@ -11,14 +11,11 @@ logger = logging.getLogger(__name__)
 
 
 def _split_statements(raw: str) -> list[str]:
-    statements = [s.strip() for s in raw.split(";") if s.strip()]
-    cleaned: list[str] = []
-    for stmt in statements:
-        lines = [ln for ln in stmt.splitlines() if not ln.strip().startswith("//")]
-        cypher = "\n".join(lines).strip()
-        if cypher:
-            cleaned.append(cypher)
-    return cleaned
+    without_line_comments = "\n".join(
+        line for line in raw.splitlines() if not line.lstrip().startswith("//")
+    )
+    statements = [s.strip() for s in without_line_comments.split(";") if s.strip()]
+    return statements
 
 
 def _run_script(driver: Driver, neo4j_database: str, script_path: Path) -> None:
