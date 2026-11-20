@@ -1,12 +1,17 @@
 import json
+import io
+import shutil
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+import hashlib
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from bootstrap_all.adapters import PreparationContext, prepare_source
 from bootstrap_all.doctor import diagnose
 
 
@@ -47,6 +52,96 @@ def run(): pass
         (self.root / 'data/example/input.csv').unlink()
         (self.root / 'data/example/input.csv').mkdir()
         self.assertTrue(any('missing input' in e for e in diagnose(self.root, self.contract, {'example'})))
+
+    def test_manifest_directory_does_not_satisfy_required_input(self):
+        input_path = self.root / 'data/example/input.csv'
+        input_path.unlink()
+        input_path.mkdir()
+        result = prepare_source(self.contract['sources'][0], PreparationContext(str(self.root), lambda _: self.fail('manifest input must not run shell')))
+        self.assertEqual(result.status, 'blocked_external')
+        self.assertEqual(result.artifacts, [])
+
+    def test_doctor_and_preparer_agree_on_directory_only_input(self):
+        input_path = self.root / 'data/example/input.csv'
+        input_path.unlink()
+        input_path.mkdir()
+        self.assertTrue(any('missing input' in e for e in diagnose(self.root, self.contract, {'example'})))
+        result = prepare_source(self.contract['sources'][0], PreparationContext(str(self.root), lambda _: self.fail('manifest input must not run shell')))
+        self.assertEqual(result.status, 'blocked_external')
+        self.assertEqual(result.artifacts, [])
+
+    def test_manifest_glob_returns_only_files_and_requires_file_per_pattern(self):
+        source = self.contract['sources'][0]
+        source['required_inputs'] = ['data/example/*.csv']
+        directory = self.root / 'data/example/directory.csv'
+        directory.mkdir()
+        first_file = self.root / 'data/example/first.csv'
+        first_file.touch()
+        (self.root / 'data/example/input.csv').unlink()
+        result = prepare_source(source, PreparationContext(str(self.root), lambda _: self.fail('manifest input must not run shell')))
+        self.assertEqual(result.status, 'ready')
+        self.assertEqual(result.artifacts, [str(first_file.resolve())])
+        source['required_inputs'] = ['data/example/*.csv', 'data/example/*.json']
+        result = prepare_source(source, PreparationContext(str(self.root), lambda _: self.fail('manifest input must not run shell')))
+        self.assertEqual(result.status, 'blocked_external')
+        self.assertEqual(result.artifacts, [])
+
+    def test_download_with_only_directory_after_callback_fails(self):
+        source = self.contract['sources'][0]
+        source['acquisition_mode'] = 'script_download'
+        source['download_commands'] = ['fetch inputs']
+        (self.root / 'data/example/input.csv').unlink()
+
+        def create_directory(command):
+            (self.root / 'data/example/input.csv').mkdir()
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        result = prepare_source(source, PreparationContext(str(self.root), create_directory))
+        self.assertEqual(result.status, 'failed_download')
+        self.assertEqual(result.artifacts, [])
+
+    def test_manifest_glob_with_only_matching_directory_is_blocked(self):
+        source = self.contract['sources'][0]
+        source['required_inputs'] = ['data/example/*.csv']
+        (self.root / 'data/example/input.csv').unlink()
+        (self.root / 'data/example/directory.csv').mkdir()
+        result = prepare_source(source, PreparationContext(str(self.root), lambda _: self.fail('manifest input must not run shell')))
+        self.assertEqual(result.status, 'blocked_external')
+        self.assertEqual(result.artifacts, [])
+
+    def test_manifest_glob_existing_directory_does_not_satisfy_each_pattern(self):
+        source = self.contract['sources'][0]
+        source['required_inputs'] = ['data/example/*.csv', 'data/example/*.json']
+        (self.root / 'data/example/input.csv').unlink()
+        (self.root / 'data/example/directory.csv').mkdir()
+        result = prepare_source(source, PreparationContext(str(self.root), lambda _: self.fail('manifest input must not run shell')))
+        self.assertEqual(result.status, 'blocked_external')
+        self.assertEqual(result.artifacts, [])
+
+    def test_download_with_matching_directory_then_regular_file_is_ready(self):
+        source = self.contract['sources'][0]
+        source['acquisition_mode'] = 'script_download'
+        source['required_inputs'] = ['data/example/*.csv']
+        source['download_commands'] = ['fetch inputs']
+        (self.root / 'data/example/input.csv').unlink()
+        calls = []
+
+        def create_file(command):
+            calls.append(command)
+            (self.root / 'data/example/downloaded.csv').write_text('id\\n1\\n')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        result = prepare_source(source, PreparationContext(str(self.root), create_file))
+        self.assertEqual(calls, ['fetch inputs'])
+        self.assertEqual(result.status, 'ready')
+        self.assertEqual(result.artifacts, [str((self.root / 'data/example/downloaded.csv').resolve())])
+
+    def test_blocked_external_source_does_not_call_shell(self):
+        source = self.contract['sources'][0]
+        source['acquisition_mode'] = 'blocked_external'
+        source['download_commands'] = ['must not execute']
+        result = prepare_source(source, PreparationContext(str(self.root), lambda command: self.fail(f'unexpected shell: {command}')))
+        self.assertEqual(result.status, 'blocked_external')
 
     def test_detects_registry_runner_and_duplicate_divergence(self):
         self.assertTrue(any('registry mismatch' in e for e in diagnose(self.root, self.contract, {'other'})))
@@ -144,6 +239,92 @@ def run(): pass
         self.assertEqual(result.returncode, 1)
         self.assertIn('unsupported or missing download command', result.stderr)
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['config', 'data', 'docs', 'etl'])
+
+    def test_real_main_terminal_preparation_skips_ingestion_and_ready_preparation_reaches_it(self):
+        repo = Path(__file__).resolve().parents[3]
+        (self.root / 'docs').mkdir()
+        (self.root / 'docs/source_registry_br_v1.csv').write_text('pipeline_id,in_universe_v1,implementation_state\nexample,true,implemented\n')
+        (self.root / 'config/bootstrap_all_contract.yml').write_text(json.dumps(self.contract))
+        runner_path = repo / 'scripts/run_bootstrap_all.py'
+        runner_source = runner_path.read_bytes()
+        self.assertEqual(hashlib.sha1(b'blob %d\0' % len(runner_source) + runner_source).hexdigest(), '1edc04c8fef035bd4f6efa3fd75fa4187774adf5')
+        namespace = {'__name__': 'f08_actual_runner_fixture', '__file__': str(runner_path)}
+        sys.path.insert(0, str(repo / 'scripts'))
+        self.addCleanup(lambda: sys.path.remove(str(repo / 'scripts')))
+        exec(compile(runner_source, str(runner_path), 'exec'), namespace)
+        self.assertEqual(namespace['prepare_source'].__module__, 'bootstrap_all.adapters.registry')
+        import bootstrap_all.adapters.registry as registry
+        self.assertEqual(Path(registry.__file__).resolve(), repo / 'scripts/bootstrap_all/adapters/registry.py')
+        calls = []
+        fixture_password = 'f08-fixture-password-only'
+        original_argv = sys.argv
+        original_which = shutil.which
+        original_isatty = sys.stdin.isatty
+        compose_up = ['docker', 'compose', '-f', str((self.root / 'infra/docker-compose.yml').resolve()), 'up', '-d', 'neo4j', 'api', 'frontend']
+        ingest_shell = 'cd /workspace/etl && uv run bracc-etl run --source example --neo4j-uri bolt://neo4j:7687 --neo4j-user neo4j --neo4j-password "$NEO4J_PASSWORD" --neo4j-database neo4j --data-dir ../data --linking-tier full'
+        ingest_argv = ['docker', 'compose', '-f', str((self.root / 'infra/docker-compose.yml').resolve()), '--profile', 'etl', 'run', '--rm', '-e', f'NEO4J_PASSWORD={fixture_password}', 'etl', 'bash', '-lc', ingest_shell]
+
+        def inert_external_call(command, *, cwd, env=None, timeout=None):
+            requested = list(command)
+            actual_cwd = str(cwd)
+            if actual_cwd != str(self.root):
+                raise AssertionError(f'unexpected cwd: {actual_cwd}')
+            if requested == compose_up:
+                calls.append({'argv': requested, 'cwd': actual_cwd, 'accepted': 'compose-up'})
+                return subprocess.CompletedProcess(command, 0, '', '')
+            if requested == ingest_argv:
+                calls.append({'argv': requested, 'cwd': actual_cwd, 'accepted': 'etl-ingest'})
+                return subprocess.CompletedProcess(command, 0, '', '')
+            raise AssertionError(f'unexpected external argv refused before effect: {requested!r}')
+
+        namespace['run_cmd'] = inert_external_call
+        namespace['wait_for_neo4j'] = lambda *args, **kwargs: True
+        namespace['wait_for_api'] = lambda *args, **kwargs: True
+        namespace['parse_dotenv'] = lambda path: {}
+        with mock.patch.dict(os.environ, {'PATH': '/usr/bin:/bin', 'NEO4J_PASSWORD': fixture_password, 'PYTHONDONTWRITEBYTECODE': '1', 'TMPDIR': str(self.root)}, clear=True), mock.patch.object(sys, 'argv', ['run_bootstrap_all.py', '--repo-root', str(self.root), '--doctor']), mock.patch.object(shutil, 'which', return_value='/inert/docker'), mock.patch.object(sys.stdin, 'isatty', wraps=sys.stdin.isatty):
+            doctor_input = self.root / 'data/example/input.csv'
+            doctor_input.unlink()
+            doctor_input.mkdir()
+            try:
+                with mock.patch.object(namespace['sys'], 'stdout', io.StringIO()), mock.patch.object(namespace['sys'], 'stderr', io.StringIO()):
+                    doctor_returncode = namespace['main']()
+                self.assertEqual(doctor_returncode, 1)
+                self.assertEqual(calls, [])
+                input_path = doctor_input
+                for expect_ingestion in (False, True):
+                    if input_path.is_dir():
+                        input_path.rmdir()
+                    elif input_path.exists():
+                        input_path.unlink()
+                    if expect_ingestion:
+                        input_path.write_text('id\n1\n')
+                    else:
+                        input_path.mkdir()
+                    sys.argv = ['run_bootstrap_all.py', '--repo-root', str(self.root), '--no-reset']
+                    calls.clear()
+                    with mock.patch.object(namespace['sys'], 'stdout', io.StringIO()), mock.patch.object(namespace['sys'], 'stderr', io.StringIO()):
+                        returncode = namespace['main']()
+                    self.assertEqual(returncode, 0)
+                    kinds = [call['accepted'] for call in calls]
+                    self.assertEqual(kinds, ['compose-up', 'etl-ingest'] if expect_ingestion else ['compose-up'])
+                    self.assertEqual([call['argv'] for call in calls if call['accepted'] == 'compose-up'], [compose_up])
+                    self.assertEqual([call['argv'] for call in calls if call['accepted'] == 'etl-ingest'], [ingest_argv] if expect_ingestion else [])
+                    self.assertTrue(all(call['cwd'] == str(self.root) for call in calls))
+                    if expect_ingestion:
+                        with self.assertRaisesRegex(AssertionError, 'unexpected external argv refused before effect'):
+                            inert_external_call(['docker', 'compose', '-f', compose_up[3], 'down'], cwd=self.root)
+                        with self.assertRaisesRegex(AssertionError, 'unexpected external argv refused before effect'):
+                            inert_external_call(ingest_argv[:-1] + ['unexpected shell args'], cwd=self.root)
+            finally:
+                doctor_input = self.root / 'data/example/input.csv'
+                if doctor_input.is_dir():
+                    doctor_input.rmdir()
+                elif doctor_input.exists():
+                    doctor_input.unlink()
+                self.assertEqual(sys.argv, ['run_bootstrap_all.py', '--repo-root', str(self.root), '--no-reset'])
+        self.assertIs(sys.argv, original_argv)
+        self.assertIs(shutil.which, original_which)
+        self.assertEqual(sys.stdin.isatty, original_isatty)
 
     def test_normal_run_validates_bad_command_before_docker(self):
         repo = Path(__file__).resolve().parents[3]

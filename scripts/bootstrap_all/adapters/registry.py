@@ -33,14 +33,14 @@ def _expand_inputs(repo_root: str, patterns: list[str]) -> list[Path]:
     matches: list[Path] = []
     for pattern in patterns:
         matches.extend(root.glob(pattern))
-    return sorted({path.resolve() for path in matches if path.exists()})
+    return sorted({path.resolve() for path in matches if path.is_file()})
 
 
 def _missing_patterns(repo_root: str, patterns: list[str]) -> list[str]:
     root = Path(repo_root)
     missing: list[str] = []
     for pattern in patterns:
-        if not any(root.glob(pattern)):
+        if not any(path.is_file() for path in root.glob(pattern)):
             missing.append(pattern)
     return missing
 
