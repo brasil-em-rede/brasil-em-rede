@@ -500,3 +500,83 @@ def test_legacy_downloader_content_type(monkeypatch, tmp_path):
         else:
             assert not target.exists()
             assert not target.with_suffix(".partial").exists()
+
+
+@pytest.mark.parametrize("content_type", ["text/csv", None])
+def test_legacy_downloader_rejects_commented_login_html(monkeypatch, tmp_path, content_type):
+    import importlib.util
+    from contextlib import nullcontext
+
+    import httpx
+
+    path = Path(__file__).parents[1] / "scripts" / "_download_utils.py"
+    spec = importlib.util.spec_from_file_location("download_utils_comment_login", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    request = httpx.Request("GET", "https://example.test")
+    headers = {} if content_type is None else {"Content-Type": content_type}
+    response = httpx.Response(
+        200, headers=headers, content=b"<!-- login -->\n<form>Sign in</form>", request=request,
+    )
+    monkeypatch.setattr(module.httpx, "stream", lambda *a, **kw: nullcontext(response))
+    target = tmp_path / ("missing-mime" if content_type is None else "csv-mime")
+
+    result = module.download_file(str(request.url), target)
+    published = target.exists()
+    published_bytes = target.read_bytes() if published else None
+    assert result is False
+    assert published is False, published_bytes
+
+
+@pytest.mark.parametrize("content_type", ["text/csv", None], ids=["text-csv", "missing-mime"])
+@pytest.mark.parametrize(
+    "case_name, body, expected",
+    [
+        pytest.param("direct-form", b"<form>Sign in</form>", False),
+        pytest.param(
+            "commented-html", b"<!-- login -->\n<html>login</html>", False,
+        ),
+        pytest.param(
+            "commented-doctype",
+            b" \n<!-- a -->\t<!-- b -->\r\n<!DOCTYPE html><body>login</body>",
+            False,
+        ),
+        pytest.param(
+            "csv-form-token-in-comment",
+            b"<!-- example: <form> -->,value\nalpha,beta\n",
+            True,
+        ),
+    ],
+    ids=["direct-form", "commented-html", "commented-doctype", "csv-form-token-in-comment"],
+)
+def test_legacy_downloader_normalizes_html_preamble(
+    monkeypatch, tmp_path, content_type, case_name, body, expected,
+):
+    import importlib.util
+    from contextlib import nullcontext
+
+    import httpx
+
+    path = Path(__file__).parents[1] / "scripts" / "_download_utils.py"
+    spec = importlib.util.spec_from_file_location("download_utils_html_preamble", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    request = httpx.Request("GET", "https://example.test")
+    headers = {} if content_type is None else {"Content-Type": content_type}
+    response = httpx.Response(200, headers=headers, content=body, request=request)
+    monkeypatch.setattr(module.httpx, "stream", lambda *a, **kw: nullcontext(response))
+    target = tmp_path / "download.csv"
+
+    result = module.download_file(str(request.url), target)
+    published = target.exists()
+    published_bytes = target.read_bytes() if published else None
+    diagnostic = (
+        f"case={case_name}; content_type={content_type!r}; "
+        f"expected={expected}; result={result!r}; published={published}; "
+        f"input_hex={body.hex()}; "
+        f"published_bytes_hex={published_bytes.hex() if published_bytes is not None else None}"
+    )
+    assert result is expected, diagnostic
+    assert published is expected, diagnostic
+    if expected:
+        assert published_bytes == body, diagnostic
