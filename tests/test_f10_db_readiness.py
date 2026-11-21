@@ -157,7 +157,7 @@ def _cypher(container: Any, password: str, statement: str) -> tuple[int, str]:
 def test_production_profile_readiness_entity_and_restart(tmp_path: Path) -> None:
     """Exercise real HTTP, shipped probe, DB outage/recovery and retained fixture."""
     suffix = secrets.token_hex(5)
-    prefix = f"bracc-m0-20261119-f10-{suffix}"
+    prefix = f"bracc-m0-20261121-f10-catalog-negative-{suffix}"
     network_name = f"{prefix}-net"
     db_name = f"{prefix}-neo4j"
     api_name = f"{prefix}-api"
@@ -169,7 +169,14 @@ def test_production_profile_readiness_entity_and_restart(tmp_path: Path) -> None
     assert _validate_cnpj_with_etl_helper(fixture_cnpj)
     assert _validate_cnpj_with_etl_helper(missing_cnpj)
     expected_source_ids = _expected_public_source_ids()
-    expected_source_ids_sha256 = hashlib.sha256("\n".join(sorted(expected_source_ids)).encode()).hexdigest()
+    registry = ROOT / "docs/source_registry_br_v1.csv"
+    expected_source_ids_sha256 = hashlib.sha256(
+        "\n".join(sorted(expected_source_ids)).encode()
+    ).hexdigest()
+    fixture_path = tmp_path / "source_registry_br_v1.csv"
+    canonical_bytes = registry.read_bytes()
+    fixture_path.write_bytes(canonical_bytes)
+    fixture_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
     client = docker.from_env()
     created_network: Any | None = None
     created_db: Any | None = None
@@ -209,7 +216,7 @@ def test_production_profile_readiness_entity_and_restart(tmp_path: Path) -> None
         created_network = client.networks.create(
             network_name,
             driver="bridge",
-            labels={"bracc.owner": "F10-DB-READINESS", "bracc.run": prefix},
+            labels={"bracc.owner": "F10-CATALOG-NEGATIVE", "bracc.run": prefix},
         )
         created_db = client.containers.create(
             NEO4J_IMAGE,
@@ -223,7 +230,7 @@ def test_production_profile_readiness_entity_and_restart(tmp_path: Path) -> None
             },
             mem_limit="1g",
             nano_cpus=1_000_000_000,
-            labels={"bracc.owner": "F10-DB-READINESS", "bracc.run": prefix},
+            labels={"bracc.owner": "F10-CATALOG-NEGATIVE", "bracc.run": prefix},
         )
         created_db.start()
         code, readiness_detail = _cypher_ready(created_db, password, time.monotonic() + 120)
@@ -234,7 +241,7 @@ def test_production_profile_readiness_entity_and_restart(tmp_path: Path) -> None
         current_module_path = ROOT / "api/src/bracc/services/neo4j_service.py"
         current_module_hash = hashlib.sha256(current_module_path.read_bytes()).hexdigest()
         registry = ROOT / "docs/source_registry_br_v1.csv"
-        current_registry_hash = hashlib.sha256(registry.read_bytes()).hexdigest()
+        current_registry_hash = fixture_sha256
         created_api = client.containers.create(
             API_IMAGE_ID,
             name=api_name,
@@ -260,10 +267,10 @@ def test_production_profile_readiness_entity_and_restart(tmp_path: Path) -> None
             },
             mem_limit="768m",
             nano_cpus=1_000_000_000,
-            labels={"bracc.owner": "F10-DB-READINESS", "bracc.run": prefix},
+            labels={"bracc.owner": "F10-CATALOG-NEGATIVE", "bracc.run": prefix},
             volumes={
                 str(ROOT / "api/src/bracc"): {"bind": "/app/bracc", "mode": "ro"},
-                str(registry): {"bind": "/app/docs/source_registry_br_v1.csv", "mode": "ro"},
+                str(fixture_path): {"bind": "/app/docs/source_registry_br_v1.csv", "mode": "ro"},
             },
         )
         created_api.start()
@@ -374,6 +381,38 @@ def test_production_profile_readiness_entity_and_restart(tmp_path: Path) -> None
         assert catalog_count > 0
         probe_ok = created_api.exec_run(["/app/.venv/bin/python", script_path], demux=True)
         assert probe_ok.exit_code == 0, "Shipped readiness probe failed while DB was healthy"
+
+        # Empty only the private CSV fixture; the API reads it per request.
+        evidence["catalog_fixture"] = {
+            "path": str(fixture_path),
+            "canonical_sha256": fixture_sha256,
+            "canonical_bytes": len(canonical_bytes),
+        }
+        fixture_path.write_bytes(b"")
+        assert _request(base + "/api/v1/meta/sources") == (200, {"sources": []})
+        assert _request(base + "/health") == (200, {"status": "ok"})
+        assert _request(base + "/api/v1/meta/health") == (200, {"neo4j": "connected"})
+        probe_empty = created_api.exec_run(["/app/.venv/bin/python", script_path], demux=True)
+        evidence["catalog_fixture"]["empty_probe_exit"] = probe_empty.exit_code
+        assert probe_empty.exit_code != 0, "Shipped readiness probe accepted an empty catalog"
+
+        fixture_path.write_bytes(canonical_bytes)
+        assert fixture_path.read_bytes() == canonical_bytes
+        restored = _request(base + "/api/v1/meta/sources")
+        assert restored[0] == 200
+        restored_ids = [source["id"] for source in restored[1]["sources"]]
+        assert (
+            _assert_public_catalog_ids(restored_ids, expected_source_ids)
+            == expected_source_ids_sha256
+        )
+        probe_restored = created_api.exec_run(["/app/.venv/bin/python", script_path], demux=True)
+        assert probe_restored.exit_code == 0, (
+            "Shipped readiness probe failed after registry restoration"
+        )
+        evidence["catalog_fixture"]["restored"] = {
+            "count": len(restored_ids),
+            "sha256": fixture_sha256,
+        }
 
         created_db.stop(timeout=10)
         outage = {
