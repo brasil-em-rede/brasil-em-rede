@@ -29,10 +29,11 @@ command -v docker >/dev/null || fail "docker is required"
 command -v "$PYTHON" >/dev/null || fail "configured Python not found: $PYTHON"
 [[ -z "$DEPS_DIR" || -d "$DEPS_DIR" ]] || fail "dependency directory does not exist: $DEPS_DIR"
 if [[ -n "$DEPS_DIR" ]]; then
-  export PYTHONPATH="$ETL/src:$DEPS_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  export PYTHONPATH="$ETL/src:$DEPS_DIR"
 else
-  export PYTHONPATH="$ETL/src${PYTHONPATH:+:$PYTHONPATH}"
+  export PYTHONPATH="$ETL/src"
 fi
+unset PYTHONHOME
 export PYTHONDONTWRITEBYTECODE=1
 ETL_ROOT="$ETL" "$PYTHON" - <<'PY' >"$LOGS/preflight-python.txt" 2>&1 || fail "selected runtime/import binding failed"
 import hashlib
@@ -45,22 +46,25 @@ import pytest
 import bracc_etl
 from bracc_etl.dimensions import projection
 from bracc_etl import loader
+from bracc_etl.pipelines import siconfi
 
 root = Path(os.environ["ETL_ROOT"]).resolve()
 src = (root / "src").resolve()
-for name, module in {"bracc_etl": bracc_etl, "projection": projection, "loader": loader}.items():
+for name, module in {"bracc_etl": bracc_etl, "projection": projection, "loader": loader, "siconfi": siconfi}.items():
     path = Path(module.__file__).resolve()
     assert path.is_relative_to(src), f"{name} imported outside selected worktree: {path}"
     print(name, path)
-print("projection_function_code_filename", projection.project_rais.__code__.co_filename)
+print("projection_function_code_filename", projection.project_siconfi.__code__.co_filename)
 print("python", sys.executable, sys.version)
 print("pytest", pytest.__version__)
 print("neo4j", neo4j.__version__)
 print("pandas", pandas.__version__)
 for relative in (
     "tests/dimensions/test_f09_metrics_boundary.py",
+    "tests/dimensions/test_siconfi_pipeline_run_metrics.py",
     "tests/integration/m0_f09_metrics_boundary.sh",
     "../docs/unification/m0-f09-metrics-boundary-20261119.md",
+    "../docs/unification/m0-siconfi-pipeline-run-metrics-20261121.md",
 ):
     path = root / relative
     print(relative, hashlib.sha256(path.read_bytes()).hexdigest())
@@ -197,9 +201,12 @@ done
 export BRACC_TEST_NEO4J_URI="$URI" BRACC_TEST_NEO4J_PASSWORD="$PASSWORD" \
   BRACC_TEST_NEO4J_DATABASE=neo4j TMPDIR="$SCRATCH_BASE"
 cd "$ETL"
+export PYTHONPATH="$ETL:$ETL/src"
 PYTEST_ARGS=(
   -m pytest -c "$ETL/pyproject.toml" -o addopts='' -m integration -vv
-  --junitxml="$LOGS/junit.xml" "$ETL/tests/dimensions/test_f09_metrics_boundary.py"
+  --junitxml="$LOGS/junit.xml" \
+  "$ETL/tests/dimensions/test_f09_metrics_boundary.py" \
+  "$ETL/tests/dimensions/test_siconfi_pipeline_run_metrics.py"
 )
 "$PYTHON" - "$LOGS/pytest.argv.json" "$PYTHON" "${PYTEST_ARGS[@]}" <<'PY'
 import json
