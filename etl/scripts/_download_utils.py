@@ -43,7 +43,14 @@ def download_file(url: str, dest: Path, *, timeout: int = 600) -> bool:
                 return False
             with partial.open("rb") as stream:
                 prefix = stream.read(1024).lstrip().lower()
-            if prefix.startswith((b"<!doctype html", b"<html", b"<head", b"<body")):
+            while prefix.startswith(b"<!--"):
+                comment_end = prefix.find(b"-->", 4)
+                if comment_end < 0:
+                    break
+                prefix = prefix[comment_end + 3:].lstrip()
+            if prefix.startswith(
+                (b"<!doctype html", b"<html", b"<head", b"<body", b"<form")
+            ) or (prefix.startswith(b"<!--") and b"<form" in prefix):
                 logger.warning("HTML response rejected: %s", dest.name)
                 return False
             partial.replace(dest)
