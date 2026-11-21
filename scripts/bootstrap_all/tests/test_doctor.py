@@ -247,7 +247,7 @@ def run(): pass
         (self.root / 'config/bootstrap_all_contract.yml').write_text(json.dumps(self.contract))
         runner_path = repo / 'scripts/run_bootstrap_all.py'
         runner_source = runner_path.read_bytes()
-        self.assertEqual(hashlib.sha1(b'blob %d\0' % len(runner_source) + runner_source).hexdigest(), '1edc04c8fef035bd4f6efa3fd75fa4187774adf5')
+        self.assertEqual(hashlib.sha1(b'blob %d\0' % len(runner_source) + runner_source, usedforsecurity=False).hexdigest(), '1edc04c8fef035bd4f6efa3fd75fa4187774adf5')
         namespace = {'__name__': 'f08_actual_runner_fixture', '__file__': str(runner_path)}
         sys.path.insert(0, str(repo / 'scripts'))
         self.addCleanup(lambda: sys.path.remove(str(repo / 'scripts')))
